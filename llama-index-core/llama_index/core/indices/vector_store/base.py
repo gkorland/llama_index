@@ -9,6 +9,7 @@ import asyncio
 import logging
 from typing import Any, Dict, List, Optional, Sequence
 
+
 from llama_index.core.async_utils import run_async_tasks
 from llama_index.core.base.base_retriever import BaseRetriever
 from llama_index.core.callbacks.base import CallbackManager
@@ -41,6 +42,7 @@ class VectorStoreIndex(BaseIndex[IndexDict]):
         show_progress (bool): Whether to show tqdm progress bars. Defaults to False.
         store_nodes_override (bool): set to True to always store Node objects in index
             store and document store even if vector store keeps text. Defaults to False
+
     """
 
     index_struct_cls = IndexDict
@@ -65,10 +67,8 @@ class VectorStoreIndex(BaseIndex[IndexDict]):
         """Initialize params."""
         self._use_async = use_async
         self._store_nodes_override = store_nodes_override
-        self._embed_model = (
-            resolve_embed_model(embed_model, callback_manager=callback_manager)
-            if embed_model
-            else Settings.embed_model
+        self._embed_model = resolve_embed_model(
+            embed_model or Settings.embed_model, callback_manager=callback_manager
         )
 
         self._insert_batch_size = insert_batch_size
@@ -199,7 +199,7 @@ class VectorStoreIndex(BaseIndex[IndexDict]):
                     node_without_embedding.embedding = None
 
                     index_struct.add_node(node_without_embedding, text_id=new_id)
-                    self._docstore.add_documents(
+                    await self._docstore.async_add_documents(
                         [node_without_embedding], allow_update=True
                     )
             else:
@@ -212,7 +212,7 @@ class VectorStoreIndex(BaseIndex[IndexDict]):
                         node_without_embedding.embedding = None
 
                         index_struct.add_node(node_without_embedding, text_id=new_id)
-                        self._docstore.add_documents(
+                        await self._docstore.async_add_documents(
                             [node_without_embedding], allow_update=True
                         )
 
@@ -295,20 +295,50 @@ class VectorStoreIndex(BaseIndex[IndexDict]):
             VectorStoreIndex only stores nodes in document store
             if vector store does not store text
         """
-        # raise an error if even one node has no content
-        if any(
-            node.get_content(metadata_mode=MetadataMode.EMBED) == "" for node in nodes
-        ):
-            raise ValueError(
-                "Cannot build index from nodes with no content. "
-                "Please ensure all nodes have content."
-            )
+        # Filter out the nodes that don't have content
+        content_nodes = [
+            node
+            for node in nodes
+            if node.get_content(metadata_mode=MetadataMode.EMBED) != ""
+        ]
 
-        return self._build_index_from_nodes(nodes, **insert_kwargs)
+        # Report if some nodes are missing content
+        if len(content_nodes) != len(nodes):
+            print("Some nodes are missing content, skipping them...")
+
+        return self._build_index_from_nodes(content_nodes, **insert_kwargs)
 
     def _insert(self, nodes: Sequence[BaseNode], **insert_kwargs: Any) -> None:
         """Insert a document."""
         self._add_nodes_to_index(self._index_struct, nodes, **insert_kwargs)
+
+    def _validate_serializable(self, nodes: Sequence[BaseNode]) -> None:
+        """Validate that the nodes are serializable."""
+        for node in nodes:
+            if isinstance(node, IndexNode):
+                try:
+                    node.dict()
+                except ValueError:
+                    self._object_map[node.index_id] = node.obj
+                    node.obj = None
+
+    async def ainsert_nodes(
+        self, nodes: Sequence[BaseNode], **insert_kwargs: Any
+    ) -> None:
+        """
+        Insert nodes.
+
+        NOTE: overrides BaseIndex.ainsert_nodes.
+            VectorStoreIndex only stores nodes in document store
+            if vector store does not store text
+        """
+        self._validate_serializable(nodes)
+
+        with self._callback_manager.as_trace("insert_nodes"):
+            await self._async_add_nodes_to_index(
+                self._index_struct, nodes, **insert_kwargs
+            )
+            self._storage_context.index_store.add_index_struct(self._index_struct)
 
     def insert_nodes(self, nodes: Sequence[BaseNode], **insert_kwargs: Any) -> None:
         """
@@ -318,13 +348,7 @@ class VectorStoreIndex(BaseIndex[IndexDict]):
             VectorStoreIndex only stores nodes in document store
             if vector store does not store text
         """
-        for node in nodes:
-            if isinstance(node, IndexNode):
-                try:
-                    node.dict()
-                except ValueError:
-                    self._object_map[node.index_id] = node.obj
-                    node.obj = None
+        self._validate_serializable(nodes)
 
         with self._callback_manager.as_trace("insert_nodes"):
             self._insert(nodes, **insert_kwargs)
@@ -332,6 +356,31 @@ class VectorStoreIndex(BaseIndex[IndexDict]):
 
     def _delete_node(self, node_id: str, **delete_kwargs: Any) -> None:
         pass
+
+    async def adelete_nodes(
+        self,
+        node_ids: List[str],
+        delete_from_docstore: bool = False,
+        **delete_kwargs: Any,
+    ) -> None:
+        """
+        Delete a list of nodes from the index.
+
+        Args:
+            node_ids (List[str]): A list of node_ids from the nodes to delete
+
+        """
+        # delete nodes from vector store
+        await self._vector_store.adelete_nodes(node_ids, **delete_kwargs)
+
+        # delete from docstore only if needed
+        if (
+            not self._vector_store.stores_text or self._store_nodes_override
+        ) and delete_from_docstore:
+            for node_id in node_ids:
+                self._index_struct.delete(node_id)
+                await self._docstore.adelete_document(node_id, raise_error=False)
+            self._storage_context.index_store.add_index_struct(self._index_struct)
 
     def delete_nodes(
         self,
@@ -354,7 +403,9 @@ class VectorStoreIndex(BaseIndex[IndexDict]):
             not self._vector_store.stores_text or self._store_nodes_override
         ) and delete_from_docstore:
             for node_id in node_ids:
+                self._index_struct.delete(node_id)
                 self._docstore.delete_document(node_id, raise_error=False)
+            self._storage_context.index_store.add_index_struct(self._index_struct)
 
     def _delete_from_index_struct(self, ref_doc_id: str) -> None:
         # delete from index_struct only if needed
